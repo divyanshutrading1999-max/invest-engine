@@ -398,6 +398,30 @@ st.caption(
 
 amount, days, tickers_raw_list = None, None, []
 
+TOP5_US = "AAPL, MSFT, GOOGL, AMZN, NVDA"
+TOP5_CRYPTO = "BTC-USD, ETH-USD, BNB-USD, SOL-USD, XRP-USD"
+TOP5_INDIA = "RELIANCE.NS, TCS.NS, HDFCBANK.NS, ICICIBANK.NS, INFY.NS"
+
+if "manual_tickers_input" not in st.session_state:
+    st.session_state["manual_tickers_input"] = "AAPL, MSFT, BTC-USD"
+if "expand_manual" not in st.session_state:
+    st.session_state["expand_manual"] = False
+
+st.caption("Quick pick a curated list (major companies/coins by market cap — not live-ranked):")
+q1, q2, q3 = st.columns(3)
+with q1:
+    if st.button("🇺🇸 Top 5 US Stocks", use_container_width=True):
+        st.session_state["manual_tickers_input"] = TOP5_US
+        st.session_state["expand_manual"] = True
+with q2:
+    if st.button("₿ Top 5 Crypto", use_container_width=True):
+        st.session_state["manual_tickers_input"] = TOP5_CRYPTO
+        st.session_state["expand_manual"] = True
+with q3:
+    if st.button("🇮🇳 Top 5 Indian Stocks", use_container_width=True):
+        st.session_state["manual_tickers_input"] = TOP5_INDIA
+        st.session_state["expand_manual"] = True
+
 st.subheader("Ask in plain English")
 prompt_text = st.text_input(
     "e.g. \"Invest $5000 in Apple, Microsoft and Bitcoin for 30 days\"",
@@ -407,7 +431,7 @@ prompt_text = st.text_input(
 )
 prompt_submitted = st.button("🔍 Analyze", type="primary")
 
-with st.expander("Or fill in the fields manually"):
+with st.expander("Or fill in the fields manually / review your quick pick", expanded=st.session_state["expand_manual"]):
     with st.form("analysis_form"):
         col1, col2 = st.columns(2)
         with col1:
@@ -416,7 +440,7 @@ with st.expander("Or fill in the fields manually"):
             m_days = st.number_input("Holding period (calendar days)", min_value=0, value=30, step=1)
         m_tickers_raw = st.text_input(
             "Assets (comma-separated)",
-            value="AAPL, MSFT, BTC-USD",
+            key="manual_tickers_input",
             help="Stock tickers (AAPL, RELIANCE.NS, TCS.BO) and/or crypto (BTC-USD, ETH-USD, SOL-USD). "
                  "For Indian stocks use the NSE (.NS) or BSE (.BO) suffix.",
         )
@@ -437,32 +461,48 @@ with adv_col2:
     run_advanced = st.checkbox("Include risk/strategy analysis", value=True,
                                 help="Adds risk metrics, benchmark comparison, and a strategy backtest leaderboard for each asset — takes a bit longer.")
 
+CURRENCY_PLACEHOLDER = "— Select a currency — (required)"
+CURRENCY_SYMBOL_MAP = {
+    "USD ($)": "$", "AED (د.إ)": "د.إ", "INR (₹)": "₹", "EUR (€)": "€",
+    "GBP (£)": "£", "SAR (﷼)": "﷼", "JPY (¥)": "¥", "SGD (S$)": "S$",
+}
+
+
+def resolve_forced_currency_symbol(currency_choice: str, custom_symbol: str = None):
+    """
+    Returns None if no fixed currency should be forced (either nothing has been
+    selected yet, or the user explicitly chose Auto — meaning fall back to
+    per-asset detection: ₹ for Indian tickers, $ otherwise). Returns a fixed
+    symbol string for every other explicit choice, including Custom.
+    """
+    if not currency_choice or currency_choice == CURRENCY_PLACEHOLDER:
+        return None
+    if currency_choice.startswith("Auto"):
+        return None
+    if currency_choice == "Custom":
+        return (custom_symbol or "").strip() or "$"
+    return CURRENCY_SYMBOL_MAP.get(currency_choice)
+
+
 cur_col1, cur_col2 = st.columns([2, 1])
 with cur_col1:
     currency_choice = st.selectbox(
-        "Display currency for the amount you enter",
-        ["Auto (₹ for Indian stocks, $ for everything else)", "USD ($)", "AED (د.إ)", "INR (₹)",
-         "EUR (€)", "GBP (£)", "SAR (﷼)", "JPY (¥)", "SGD (S$)", "Custom"],
+        "Display currency for the amount you enter *",
+        [CURRENCY_PLACEHOLDER, "Auto (₹ for Indian stocks, $ for everything else)", "USD ($)", "AED (د.إ)",
+         "INR (₹)", "EUR (€)", "GBP (£)", "SAR (﷼)", "JPY (¥)", "SGD (S$)", "Custom"],
         index=0,
-        help="This does NOT convert currencies — it just labels your amount and the projected "
-             "results in the currency you pick, and applies the historical % return directly to "
-             "that number. It does not account for exchange-rate movements.",
+        help="Required before running an analysis. This does NOT convert currencies — it just "
+             "labels your amount and the projected results in the currency you pick, and applies "
+             "the historical % return directly to that number. It does not account for "
+             "exchange-rate movements.",
     )
 with cur_col2:
     custom_currency_symbol = None
     if currency_choice == "Custom":
         custom_currency_symbol = st.text_input("Symbol/code", value="CHF", max_chars=6)
 
-CURRENCY_SYMBOL_MAP = {
-    "USD ($)": "$", "AED (د.إ)": "د.إ", "INR (₹)": "₹", "EUR (€)": "€",
-    "GBP (£)": "£", "SAR (﷼)": "﷼", "JPY (¥)": "¥", "SGD (S$)": "S$",
-}
-if currency_choice.startswith("Auto"):
-    forced_currency_symbol = None  # fall back to per-asset auto-detection ($/₹)
-elif currency_choice == "Custom":
-    forced_currency_symbol = (custom_currency_symbol or "").strip() or "$"
-else:
-    forced_currency_symbol = CURRENCY_SYMBOL_MAP[currency_choice]
+forced_currency_symbol = resolve_forced_currency_symbol(currency_choice, custom_currency_symbol)
+currency_was_selected = currency_choice != CURRENCY_PLACEHOLDER
 
 
 def display_currency(ticker: str) -> str:
@@ -504,6 +544,8 @@ if manual_submitted:
 if submitted:
     # ---- Input validation ----
     errors = []
+    if not currency_was_selected:
+        errors.append("Please select a display currency above before running the analysis.")
     if amount is None or amount <= 0:
         errors.append("Amount must be greater than 0.")
     if days is None or days <= 0:
@@ -561,6 +603,25 @@ if submitted:
                     "ℹ️ Indian stocks (NSE/BSE) are shown in ₹ — this tool does not convert currencies, "
                     "the amount you entered is applied as-is per asset in that asset's own currency."
                 )
+
+            # ---- Quick summary table: win rate, expected (median), minimum (worst case) ----
+            st.markdown("### Quick summary")
+            summary_rows = []
+            for s, note in ranked:
+                cur = display_currency(s.asset)
+                summary_rows.append({
+                    "Asset": s.asset,
+                    "Win Rate %": round(s.win_rate_pct, 1),
+                    "Expected (median)": f"{cur}{s.median_value:,.0f}",
+                    "Minimum (worst case)": f"{cur}{s.worst_value:,.0f}",
+                    "Maximum (best case)": f"{cur}{s.best_value:,.0f}",
+                })
+            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+            st.caption(
+                "Win Rate = % of historical windows of this length that were profitable. "
+                "Expected = median historical outcome. Minimum/Maximum = 5th/95th percentile "
+                "historical outcomes (not absolute floors/ceilings — worse or better has happened)."
+            )
 
             # ---- Comparison chart across assets (if more than one) ----
             if len(ranked) > 1:
