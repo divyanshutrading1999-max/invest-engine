@@ -79,12 +79,17 @@ def is_crypto_ticker(ticker: str) -> bool:
     return "-" in t and t.endswith(("USD", "USDT"))
 
 
-def fetch_and_analyze(ticker: str, amount: float, calendar_days: int, timeout_sec: int = 15):
+def fetch_and_analyze(ticker: str, amount: float, calendar_days: int, timeout_sec: int = 15, retries: int = 3):
     """
     Returns (ReturnStats, note) on success, or (None, error_message) on failure.
     Every failure mode is caught and turned into a plain-English message —
     nothing raises up to crash the app.
+
+    Retries a few times with a short delay: Yahoo Finance occasionally
+    rate-limits requests coming from shared cloud IPs (like Streamlit Cloud),
+    and a retry usually clears it.
     """
+    import time
     import yfinance as yf
 
     ticker = ticker.strip().upper()
@@ -94,12 +99,24 @@ def fetch_and_analyze(ticker: str, amount: float, calendar_days: int, timeout_se
     crypto = is_crypto_ticker(ticker)
     trading_days = calendar_to_trading_days(calendar_days, crypto)
 
-    try:
-        hist = yf.Ticker(ticker).history(period="5y", auto_adjust=True, timeout=timeout_sec)
-    except Exception as e:
-        return None, f"Could not reach data source for '{ticker}' (network/timeout issue). Try again shortly."
+    hist = None
+    had_exception = False
+    for attempt in range(retries):
+        try:
+            hist = yf.Ticker(ticker).history(period="5y", auto_adjust=True, timeout=timeout_sec)
+            had_exception = False
+            if hist is not None and not hist.empty:
+                break
+        except Exception:
+            had_exception = True
+        time.sleep(1.5 * (attempt + 1))  # small backoff between attempts
 
     if hist is None or hist.empty:
+        if had_exception:
+            return None, (
+                f"Could not reach data source for '{ticker}' after {retries} attempts "
+                f"(network/rate-limit issue). Try again shortly."
+            )
         return None, f"'{ticker}' not found — check the symbol (e.g. AAPL, RELIANCE.NS, BTC-USD)."
 
     closes = hist["Close"].dropna()
@@ -122,6 +139,97 @@ def fetch_and_analyze(ticker: str, amount: float, calendar_days: int, timeout_se
 
 
 # ---------------------------------------------------------------------------
+# Natural-language prompt parsing
+# ---------------------------------------------------------------------------
+
+# Common company/coin names -> tickers, so "apple" or "bitcoin" work in plain English
+NAME_TO_TICKER = {
+    "apple": "AAPL", "microsoft": "MSFT", "google": "GOOGL", "alphabet": "GOOGL",
+    "amazon": "AMZN", "nvidia": "NVDA", "meta": "META", "facebook": "META",
+    "tesla": "TSLA", "netflix": "NFLX", "jpmorgan": "JPM", "visa": "V",
+    "spy": "SPY", "s&p 500": "SPY", "sp500": "SPY", "nasdaq": "QQQ",
+    "bitcoin": "BTC-USD", "btc": "BTC-USD", "ethereum": "ETH-USD", "eth": "ETH-USD",
+    "solana": "SOL-USD", "sol": "SOL-USD", "binance coin": "BNB-USD", "bnb": "BNB-USD",
+    "dogecoin": "DOGE-USD", "doge": "DOGE-USD", "ripple": "XRP-USD", "xrp": "XRP-USD",
+}
+
+
+def parse_prompt(text: str):
+    """
+    Best-effort extraction of amount, holding-period days, and tickers from a
+    free-text prompt. Returns (amount, days, tickers, warnings) — any piece it
+    can't confidently find comes back as None, with a warning explaining what's
+    missing, so the UI can ask the user to fill the gap rather than guessing.
+    """
+    import re
+
+    warnings = []
+    lower = text.lower()
+
+    # ---- amount ----
+    amount = None
+    m = re.search(r'[\$₹]?\s*([\d,]+(?:\.\d+)?)\s*(k|thousand|m|million)?', lower)
+    # Only treat this as the amount if it's near investment-y words, to avoid grabbing "30 days" as $30
+    amt_context = re.search(
+        r'(?:invest|put in|amount|with|of)\s*[\$₹]?\s*([\d,]+(?:\.\d+)?)\s*(k|thousand|m|million)?',
+        lower,
+    )
+    candidate = amt_context or (m if "$" in text or "₹" in text else None)
+    if candidate:
+        num = float(candidate.group(1).replace(",", ""))
+        unit = candidate.group(2)
+        if unit in ("k", "thousand"):
+            num *= 1_000
+        elif unit in ("m", "million"):
+            num *= 1_000_000
+        amount = num
+    else:
+        warnings.append("Couldn't find an investment amount — please add one (e.g. '$5000').")
+
+    # ---- days ----
+    days = None
+    d = re.search(r'(\d+)\s*(day|days|week|weeks|month|months|year|years)', lower)
+    if d:
+        n = int(d.group(1))
+        unit = d.group(2)
+        if unit.startswith("week"):
+            days = n * 7
+        elif unit.startswith("month"):
+            days = n * 30
+        elif unit.startswith("year"):
+            days = n * 365
+        else:
+            days = n
+    else:
+        warnings.append("Couldn't find a holding period — please add one (e.g. '30 days' or '4 months').")
+
+    # ---- tickers ----
+    # Collect (start_index, ticker) candidates from both named companies/coins and
+    # explicit caps tickers, then sort by where they appear in the original text
+    # so the result order matches what the user typed.
+    candidates = []
+    for name, tick in NAME_TO_TICKER.items():
+        m2 = re.search(r'\b' + re.escape(name) + r'\b', lower)
+        if m2:
+            candidates.append((m2.start(), tick))
+    for tok_match in re.finditer(r'\b[A-Z]{2,10}(?:[-.][A-Z]{1,4})?\b', text):
+        tok = tok_match.group()
+        if tok not in ("USD", "ETF"):
+            candidates.append((tok_match.start(), tok.upper()))
+
+    candidates.sort(key=lambda x: x[0])
+    tickers = []
+    for _, tick in candidates:
+        if tick not in tickers:
+            tickers.append(tick)
+
+    if not tickers:
+        warnings.append("Couldn't find any assets — please name a ticker (e.g. AAPL) or company/coin (e.g. Bitcoin).")
+
+    return amount, days, tickers, warnings
+
+
+# ---------------------------------------------------------------------------
 # Streamlit UI
 # ---------------------------------------------------------------------------
 
@@ -133,31 +241,66 @@ st.caption(
     "This is not financial advice."
 )
 
-with st.form("analysis_form"):
-    col1, col2 = st.columns(2)
-    with col1:
-        amount = st.number_input("Investment amount", min_value=0.0, value=5000.0, step=100.0)
-    with col2:
-        days = st.number_input("Holding period (calendar days)", min_value=0, value=30, step=1)
+amount, days, tickers_raw_list = None, None, []
 
-    tickers_raw = st.text_input(
-        "Assets (comma-separated)",
-        value="AAPL, MSFT, BTC-USD",
-        help="Stock tickers (AAPL, RELIANCE.NS, TCS.BO) and/or crypto (BTC-USD, ETH-USD, SOL-USD)",
-    )
-    submitted = st.form_submit_button("Run Analysis")
+st.subheader("Ask in plain English")
+prompt_text = st.text_input(
+    "e.g. \"Invest $5000 in Apple, Microsoft and Bitcoin for 30 days\"",
+    placeholder="Invest $5000 in Apple, Microsoft and Bitcoin for 30 days",
+    key="prompt_box",
+)
+prompt_submitted = st.button("Analyze", type="primary")
+
+with st.expander("Or fill in the fields manually"):
+    with st.form("analysis_form"):
+        col1, col2 = st.columns(2)
+        with col1:
+            m_amount = st.number_input("Investment amount", min_value=0.0, value=5000.0, step=100.0)
+        with col2:
+            m_days = st.number_input("Holding period (calendar days)", min_value=0, value=30, step=1)
+        m_tickers_raw = st.text_input(
+            "Assets (comma-separated)",
+            value="AAPL, MSFT, BTC-USD",
+            help="Stock tickers (AAPL, RELIANCE.NS, TCS.BO) and/or crypto (BTC-USD, ETH-USD, SOL-USD)",
+        )
+        manual_submitted = st.form_submit_button("Run Analysis (manual)")
+
+submitted = False
+
+if prompt_submitted:
+    if not prompt_text or not prompt_text.strip():
+        st.error("Type something first — e.g. \"Invest $5000 in Apple for 30 days\".")
+    else:
+        p_amount, p_days, p_tickers, p_warnings = parse_prompt(prompt_text)
+        if p_warnings:
+            for w in p_warnings:
+                st.warning(w)
+        st.info(
+            f"**Understood:** Amount = {f'${p_amount:,.0f}' if p_amount else '—'} | "
+            f"Holding period = {f'{p_days} days' if p_days else '—'} | "
+            f"Assets = {', '.join(p_tickers) if p_tickers else '—'}\n\n"
+            "If that's wrong, use the manual fields below instead."
+        )
+        if p_amount and p_days and p_tickers:
+            amount, days, tickers_raw_list = p_amount, p_days, p_tickers
+            submitted = True
+
+if manual_submitted:
+    amount, days = m_amount, m_days
+    tickers_raw_list = [t.strip().upper() for t in m_tickers_raw.split(",") if t.strip()]
+    submitted = True
 
 if submitted:
     # ---- Input validation ----
     errors = []
-    if amount <= 0:
+    if amount is None or amount <= 0:
         errors.append("Amount must be greater than 0.")
-    if days <= 0:
+    if days is None or days <= 0:
         errors.append("Holding period must be at least 1 day.")
-    if days > 3650:
+    if days is not None and days > 3650:
         errors.append("Holding period is unreasonably large (max 3650 days / 10 years).")
 
-    raw_tickers = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
+    raw_tickers = tickers_raw_list
     if not raw_tickers:
         errors.append("Enter at least one ticker.")
 
