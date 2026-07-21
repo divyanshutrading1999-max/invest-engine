@@ -13,6 +13,7 @@ DEPLOY.md for step-by-step instructions.
 import streamlit as st
 import pandas as pd
 import numpy as np
+import plotly.graph_objects as go
 from dataclasses import dataclass
 
 
@@ -35,6 +36,7 @@ class ReturnStats:
     median_value: float
     best_value: float
     worst_value: float
+    raw_returns_pct: list
 
 
 def calendar_to_trading_days(calendar_days: int, is_crypto: bool) -> int:
@@ -67,6 +69,7 @@ def compute_stats(price_series: pd.Series, holding_days: int, amount: float) -> 
         median_value=round(amount * (1 + median / 100), 2),
         best_value=round(amount * (1 + float(np.percentile(window_returns_pct, 95)) / 100), 2),
         worst_value=round(amount * (1 + float(np.percentile(window_returns_pct, 5)) / 100), 2),
+        raw_returns_pct=window_returns_pct.tolist(),
     )
 
 
@@ -233,8 +236,19 @@ def parse_prompt(text: str):
 # Streamlit UI
 # ---------------------------------------------------------------------------
 
-st.set_page_config(page_title="Investment Return Expectation Engine", layout="wide")
-st.title("Investment Return-Expectation Engine")
+st.set_page_config(page_title="Investment Return Expectation Engine", layout="wide", page_icon="📊")
+
+st.markdown(
+    """
+    <style>
+    .stMetric { background-color: rgba(255,255,255,0.03); border-radius: 10px; padding: 10px 14px; }
+    div[data-testid="stExpander"] { border-radius: 10px; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("📊 Investment Return-Expectation Engine")
 st.caption(
     "Shows **historical** rolling-window statistics for your chosen amount, holding period, "
     "and assets — not a prediction. Past performance does not guarantee future results. "
@@ -248,8 +262,9 @@ prompt_text = st.text_input(
     "e.g. \"Invest $5000 in Apple, Microsoft and Bitcoin for 30 days\"",
     placeholder="Invest $5000 in Apple, Microsoft and Bitcoin for 30 days",
     key="prompt_box",
+    label_visibility="collapsed",
 )
-prompt_submitted = st.button("Analyze", type="primary")
+prompt_submitted = st.button("🔍 Analyze", type="primary")
 
 with st.expander("Or fill in the fields manually"):
     with st.form("analysis_form"):
@@ -329,41 +344,109 @@ if submitted:
                     results.append((stats, note_or_error))
 
         if failures:
-            st.warning("Some assets couldn't be analyzed:")
-            for t, msg in failures:
-                st.write(f"- **{t}**: {msg}")
+            with st.expander(f"⚠️ {len(failures)} asset(s) couldn't be analyzed", expanded=True):
+                for t, msg in failures:
+                    st.write(f"- **{t}**: {msg}")
 
         if not results:
             st.error("No assets could be analyzed. Check your tickers and try again.")
         else:
-            st.success(f"Analysis complete for {len(results)} of {len(tickers)} asset(s).")
+            ranked = sorted(results, key=lambda r: r[0].risk_adjusted, reverse=True)
+            st.success(f"✅ Analysis complete for {len(results)} of {len(tickers)} asset(s), on ${amount:,.0f} over {days} days.")
 
-            rows = []
-            for stats, note in results:
-                rows.append({
-                    "Asset": stats.asset,
-                    "Type": note,
-                    "Windows": stats.num_windows,
-                    "Median %": round(stats.median_return_pct, 2),
-                    "Win Rate %": round(stats.win_rate_pct, 1),
-                    "Best %": round(stats.best_case_pct, 2),
-                    "Worst %": round(stats.worst_case_pct, 2),
-                    "Volatility %": round(stats.volatility_pct, 2),
-                    "Risk-Adjusted": round(stats.risk_adjusted, 3),
-                    f"Median Value ($)": stats.median_value,
-                    f"Best Case ($)": stats.best_value,
-                    f"Worst Case ($)": stats.worst_value,
-                })
+            # ---- Comparison chart across assets (if more than one) ----
+            if len(ranked) > 1:
+                st.markdown("### How they compare")
+                names = [s.asset for s, _ in ranked]
+                medians = [s.median_return_pct for s, _ in ranked]
+                colors = ["#2ecc71" if m >= 0 else "#e74c3c" for m in medians]
 
-            df = pd.DataFrame(rows).sort_values("Risk-Adjusted", ascending=False)
-            st.dataframe(df, use_container_width=True, hide_index=True)
+                fig_compare = go.Figure()
+                fig_compare.add_trace(go.Bar(
+                    x=names, y=medians, marker_color=colors,
+                    text=[f"{m:+.2f}%" for m in medians], textposition="outside",
+                    name="Median return",
+                ))
+                fig_compare.update_layout(
+                    height=320, margin=dict(t=10, b=10, l=10, r=10),
+                    yaxis_title="Median historical return (%)",
+                    showlegend=False,
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                )
+                fig_compare.add_hline(y=0, line_dash="dot", line_color="gray")
+                st.plotly_chart(fig_compare, use_container_width=True)
 
-            st.caption(
-                f"Statistics computed from historical {days}-calendar-day rolling windows "
-                f"(converted to trading days for stocks/ETFs). "
-                "Median/Best/Worst reflect the 50th/95th/5th percentiles of all historical "
-                "windows of this length for each asset."
-            )
+            # ---- Per-asset cards ----
+            st.markdown("### Asset breakdown")
+            for stats, note in ranked:
+                is_positive = stats.median_return_pct >= 0
+                emoji = "🟢" if is_positive else "🔴"
+                with st.container(border=True):
+                    top_col1, top_col2 = st.columns([3, 1])
+                    with top_col1:
+                        st.markdown(f"#### {emoji} {stats.asset}  \n*{note} · {stats.num_windows} historical windows analyzed*")
+                    with top_col2:
+                        st.metric("Win rate", f"{stats.win_rate_pct:.0f}%")
+
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Median return", f"{stats.median_return_pct:+.2f}%")
+                    m2.metric("Best case (95th pct)", f"{stats.best_case_pct:+.2f}%")
+                    m3.metric("Worst case (5th pct)", f"{stats.worst_case_pct:+.2f}%")
+                    m4.metric("Volatility", f"{stats.volatility_pct:.2f}%")
+
+                    # ---- Range visual: worst -> median -> best ----
+                    fig_range = go.Figure()
+                    fig_range.add_trace(go.Bar(
+                        x=[stats.best_case_pct - stats.worst_case_pct],
+                        y=[stats.asset], base=[stats.worst_case_pct],
+                        orientation="h",
+                        marker=dict(color="rgba(100,149,237,0.35)"),
+                        showlegend=False, hoverinfo="skip",
+                    ))
+                    fig_range.add_trace(go.Scatter(
+                        x=[stats.median_return_pct], y=[stats.asset],
+                        mode="markers+text",
+                        marker=dict(size=16, color="#2ecc71" if is_positive else "#e74c3c", symbol="diamond"),
+                        text=[f"  Median {stats.median_return_pct:+.1f}%"], textposition="top center",
+                        showlegend=False,
+                    ))
+                    fig_range.add_vline(x=0, line_dash="dot", line_color="gray")
+                    fig_range.update_layout(
+                        height=140, margin=dict(t=30, b=20, l=10, r=10),
+                        xaxis_title="Historical return over this holding period (%)",
+                        yaxis=dict(showticklabels=False),
+                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    )
+                    st.plotly_chart(fig_range, use_container_width=True, key=f"range_{stats.asset}")
+
+                    # ---- Dollar projection ----
+                    d1, d2, d3 = st.columns(3)
+                    d1.metric("If worst case", f"${stats.worst_value:,.0f}", f"{stats.worst_case_pct:+.1f}%")
+                    d2.metric("If median case", f"${stats.median_value:,.0f}", f"{stats.median_return_pct:+.1f}%")
+                    d3.metric("If best case", f"${stats.best_value:,.0f}", f"{stats.best_case_pct:+.1f}%")
+
+                    # ---- Full distribution (optional deep-dive) ----
+                    with st.expander("See full historical distribution"):
+                        fig_hist = go.Figure()
+                        fig_hist.add_trace(go.Histogram(
+                            x=stats.raw_returns_pct, nbinsx=40,
+                            marker_color="rgba(100,149,237,0.6)",
+                        ))
+                        fig_hist.add_vline(x=stats.median_return_pct, line_color="#2ecc71",
+                                            annotation_text="Median", line_width=2)
+                        fig_hist.add_vline(x=0, line_dash="dot", line_color="gray")
+                        fig_hist.update_layout(
+                            height=280, margin=dict(t=20, b=20, l=10, r=10),
+                            xaxis_title=f"Return over {days}-day holding windows (%)",
+                            yaxis_title="Number of historical windows",
+                            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                        )
+                        st.plotly_chart(fig_hist, use_container_width=True, key=f"hist_{stats.asset}")
+                        st.caption(
+                            "Each bar = how many historical windows of this length landed in that return "
+                            "range. A wide, spread-out shape means high variance; a tall narrow shape "
+                            "near the median means more consistent historical outcomes."
+                        )
 
 st.divider()
 st.caption(
