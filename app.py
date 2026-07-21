@@ -16,6 +16,10 @@ import numpy as np
 import plotly.graph_objects as go
 from dataclasses import dataclass
 
+import risk_metrics as rm
+import benchmark as bm
+import strategies as strat
+
 
 # ---------------------------------------------------------------------------
 # Backtest math
@@ -74,6 +78,80 @@ def compute_stats(price_series: pd.Series, holding_days: int, amount: float) -> 
 
 
 # ---------------------------------------------------------------------------
+# Verdict / "should I follow this" analyser
+#
+# This is a transparent, rules-based read of the stats already computed above
+# — not a prediction, not personalized advice, and not a signal to act on.
+# It exists to summarize what the historical numbers say in plain language,
+# with the reasoning always shown alongside so nothing is a black box.
+# ---------------------------------------------------------------------------
+
+VERDICT_FAVORABLE = "Historically Favorable"
+VERDICT_MIXED = "Mixed / Uncertain"
+VERDICT_UNFAVORABLE = "Historically Unfavorable"
+
+
+def generate_verdict(stats: "ReturnStats"):
+    """
+    Returns (label, color, score_0_100, reasons: list[str]).
+
+    The score is a simple composite of win rate and risk-adjusted return,
+    scaled to 0-100 for easy comparison across assets. It is NOT a
+    probability, confidence level, or forecast — just a ranking aid.
+    """
+    reasons = []
+    points = 0
+    max_points = 4
+
+    # Factor 1: win rate
+    if stats.win_rate_pct >= 55:
+        points += 1
+        reasons.append(f"✅ Win rate is {stats.win_rate_pct:.0f}% — historically profitable more often than not.")
+    elif stats.win_rate_pct <= 45:
+        reasons.append(f"❌ Win rate is only {stats.win_rate_pct:.0f}% — historically unprofitable more often than not.")
+    else:
+        reasons.append(f"➖ Win rate is {stats.win_rate_pct:.0f}% — close to a coin flip historically.")
+
+    # Factor 2: median return sign and magnitude
+    if stats.median_return_pct > 0.3:
+        points += 1
+        reasons.append(f"✅ Median historical return is {stats.median_return_pct:+.2f}% — meaningfully positive.")
+    elif stats.median_return_pct < 0:
+        reasons.append(f"❌ Median historical return is {stats.median_return_pct:+.2f}% — the typical outcome was a loss.")
+    else:
+        reasons.append(f"➖ Median historical return is {stats.median_return_pct:+.2f}% — close to flat.")
+
+    # Factor 3: risk-adjusted return (median / volatility)
+    if stats.risk_adjusted >= 0.12:
+        points += 1
+        reasons.append(f"✅ Risk-adjusted score ({stats.risk_adjusted:.2f}) is solid — return has been decent relative to how much it swings.")
+    elif stats.risk_adjusted <= 0:
+        reasons.append(f"❌ Risk-adjusted score ({stats.risk_adjusted:.2f}) is negative or zero — the swings haven't historically been worth it.")
+    else:
+        reasons.append(f"➖ Risk-adjusted score ({stats.risk_adjusted:.2f}) is modest — some reward for the risk, but not strong.")
+
+    # Factor 4: downside severity
+    if stats.worst_case_pct >= -12:
+        points += 1
+        reasons.append(f"✅ Worst-case historical scenario ({stats.worst_case_pct:+.1f}%) has been relatively contained.")
+    elif stats.worst_case_pct <= -25:
+        reasons.append(f"❌ Worst-case historical scenario ({stats.worst_case_pct:+.1f}%) has been severe — meaningful capital loss was possible.")
+    else:
+        reasons.append(f"➖ Worst-case historical scenario ({stats.worst_case_pct:+.1f}%) has been moderate.")
+
+    score = round((points / max_points) * 100)
+
+    if points >= 3:
+        label, color = VERDICT_FAVORABLE, "#2ecc71"
+    elif points <= 1:
+        label, color = VERDICT_UNFAVORABLE, "#e74c3c"
+    else:
+        label, color = VERDICT_MIXED, "#f39c12"
+
+    return label, color, score, reasons
+
+
+# ---------------------------------------------------------------------------
 # Data fetching — single source (Yahoo Finance), with explicit failure modes
 # ---------------------------------------------------------------------------
 
@@ -82,15 +160,13 @@ def is_crypto_ticker(ticker: str) -> bool:
     return "-" in t and t.endswith(("USD", "USDT"))
 
 
-def fetch_and_analyze(ticker: str, amount: float, calendar_days: int, timeout_sec: int = 15, retries: int = 3):
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_price_history(ticker: str, timeout_sec: int = 15, retries: int = 3):
     """
-    Returns (ReturnStats, note) on success, or (None, error_message) on failure.
-    Every failure mode is caught and turned into a plain-English message —
-    nothing raises up to crash the app.
-
-    Retries a few times with a short delay: Yahoo Finance occasionally
-    rate-limits requests coming from shared cloud IPs (like Streamlit Cloud),
-    and a retry usually clears it.
+    Returns (closes: pd.Series or None, error_message: str or None).
+    Shared by fetch_and_analyze and the advanced-analysis features (risk
+    metrics, benchmark comparison, strategy backtests) so there's a single,
+    tested source of price data with the same retry/error handling everywhere.
     """
     import time
     import yfinance as yf
@@ -98,9 +174,6 @@ def fetch_and_analyze(ticker: str, amount: float, calendar_days: int, timeout_se
     ticker = ticker.strip().upper()
     if not ticker:
         return None, "Empty ticker."
-
-    crypto = is_crypto_ticker(ticker)
-    trading_days = calendar_to_trading_days(calendar_days, crypto)
 
     hist = None
     had_exception = False
@@ -112,7 +185,7 @@ def fetch_and_analyze(ticker: str, amount: float, calendar_days: int, timeout_se
                 break
         except Exception:
             had_exception = True
-        time.sleep(1.5 * (attempt + 1))  # small backoff between attempts
+        time.sleep(1.5 * (attempt + 1))
 
     if hist is None or hist.empty:
         if had_exception:
@@ -123,6 +196,22 @@ def fetch_and_analyze(ticker: str, amount: float, calendar_days: int, timeout_se
         return None, f"'{ticker}' not found — check the symbol (e.g. AAPL, RELIANCE.NS, BTC-USD)."
 
     closes = hist["Close"].dropna()
+    return closes, None
+
+
+def fetch_and_analyze(ticker: str, amount: float, calendar_days: int, timeout_sec: int = 15, retries: int = 3):
+    """
+    Returns (ReturnStats, note) on success, or (None, error_message) on failure.
+    Every failure mode is caught and turned into a plain-English message —
+    nothing raises up to crash the app.
+    """
+    ticker = ticker.strip().upper()
+    crypto = is_crypto_ticker(ticker)
+    trading_days = calendar_to_trading_days(calendar_days, crypto)
+
+    closes, err = fetch_price_history(ticker, timeout_sec, retries)
+    if closes is None:
+        return None, err
 
     if len(closes) <= trading_days:
         available_days = len(closes)
@@ -280,6 +369,23 @@ with st.expander("Or fill in the fields manually"):
         )
         manual_submitted = st.form_submit_button("Run Analysis (manual)")
 
+adv_col1, adv_col2 = st.columns([2, 1])
+with adv_col1:
+    benchmark_choice = st.selectbox(
+        "Compare against benchmark",
+        ["SPY (S&P 500)", "QQQ (Nasdaq 100)", "GLD (Gold)", "BTC-USD", "None"],
+        index=0,
+    )
+with adv_col2:
+    run_advanced = st.checkbox("Include risk/strategy analysis", value=True,
+                                help="Adds risk metrics, benchmark comparison, and a strategy backtest leaderboard for each asset — takes a bit longer.")
+
+BENCHMARK_MAP = {
+    "SPY (S&P 500)": "SPY", "QQQ (Nasdaq 100)": "QQQ", "GLD (Gold)": "GLD",
+    "BTC-USD": "BTC-USD", "None": None,
+}
+benchmark_ticker = BENCHMARK_MAP[benchmark_choice]
+
 submitted = False
 
 if prompt_submitted:
@@ -381,12 +487,37 @@ if submitted:
             for stats, note in ranked:
                 is_positive = stats.median_return_pct >= 0
                 emoji = "🟢" if is_positive else "🔴"
+                verdict_label, verdict_color, verdict_score, verdict_reasons = generate_verdict(stats)
                 with st.container(border=True):
                     top_col1, top_col2 = st.columns([3, 1])
                     with top_col1:
                         st.markdown(f"#### {emoji} {stats.asset}  \n*{note} · {stats.num_windows} historical windows analyzed*")
                     with top_col2:
                         st.metric("Win rate", f"{stats.win_rate_pct:.0f}%")
+
+                    # ---- Verdict badge ----
+                    st.markdown(
+                        f"""
+                        <div style="background-color:{verdict_color}22; border-left:4px solid {verdict_color};
+                                    border-radius:6px; padding:10px 14px; margin:8px 0;">
+                            <span style="font-size:1.05em; font-weight:600; color:{verdict_color};">
+                                {verdict_label}
+                            </span>
+                            <span style="opacity:0.7;"> · Historical Favorability Score: {verdict_score}/100</span>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    with st.expander("Why this verdict?"):
+                        for r in verdict_reasons:
+                            st.write(r)
+                        st.caption(
+                            "This is a rules-based summary of the historical statistics above, based on "
+                            "win rate, median return, risk-adjusted return, and worst-case severity for "
+                            "this exact holding period. It is not a prediction, not personalized financial "
+                            "advice, and not a signal to buy or sell — just a plain-language read of what "
+                            "the history shows."
+                        )
 
                     m1, m2, m3, m4 = st.columns(4)
                     m1.metric("Median return", f"{stats.median_return_pct:+.2f}%")
@@ -447,6 +578,101 @@ if submitted:
                             "range. A wide, spread-out shape means high variance; a tall narrow shape "
                             "near the median means more consistent historical outcomes."
                         )
+
+                    # ---- Advanced analysis: risk metrics, benchmark, strategy leaderboard ----
+                    if run_advanced:
+                        with st.expander("📈 Advanced analysis: risk, benchmark & strategy backtest"):
+                            closes_full, adv_err = fetch_price_history(stats.asset)
+                            if closes_full is None or len(closes_full) < 30:
+                                st.warning(f"Couldn't load enough data for advanced analysis: {adv_err or 'insufficient history'}")
+                            else:
+                                risk_report = rm.full_risk_report(closes_full)
+
+                                st.markdown("**Risk metrics** (computed from full 5-year daily history)")
+                                r1, r2, r3, r4 = st.columns(4)
+                                r1.metric("Sharpe Ratio", f"{risk_report['sharpe_ratio']:.2f}")
+                                r2.metric("Sortino Ratio", f"{risk_report['sortino_ratio']:.2f}")
+                                r3.metric("Max Drawdown", f"{risk_report['max_drawdown_pct']:.1f}%")
+                                r4.metric("Calmar Ratio", f"{risk_report['calmar_ratio']:.2f}")
+                                r5, r6, r7, r8 = st.columns(4)
+                                r5.metric("VaR (95%, daily)", f"{risk_report['var_95_pct']:.2f}%")
+                                r6.metric("CVaR (95%, daily)", f"{risk_report['cvar_95_pct']:.2f}%")
+                                r7.metric("Ulcer Index", f"{risk_report['ulcer_index']:.2f}")
+                                r8.metric("Skewness", f"{risk_report['skewness']:.2f}")
+
+                                fig_dd = go.Figure()
+                                fig_dd.add_trace(go.Scatter(
+                                    x=risk_report["drawdown_series"].index, y=risk_report["drawdown_series"],
+                                    fill="tozeroy", line=dict(color="#e74c3c"), name="Drawdown",
+                                ))
+                                fig_dd.update_layout(
+                                    height=200, title="Drawdown over time (5y)",
+                                    margin=dict(t=30, b=10, l=10, r=10),
+                                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                                )
+                                st.plotly_chart(fig_dd, use_container_width=True, key=f"dd_{stats.asset}")
+
+                                # ---- Benchmark comparison ----
+                                if benchmark_ticker and benchmark_ticker.upper() != stats.asset.upper():
+                                    bench_closes, bench_err = fetch_price_history(benchmark_ticker)
+                                    if bench_closes is None:
+                                        st.info(f"Couldn't load benchmark ({benchmark_ticker}): {bench_err}")
+                                    else:
+                                        try:
+                                            bench_report = bm.full_benchmark_report(closes_full, bench_closes)
+                                            st.markdown(f"**Benchmark comparison vs {benchmark_ticker}**")
+                                            b1, b2, b3 = st.columns(3)
+                                            b1.metric("Alpha (annualized)", f"{bench_report['alpha_pct']:+.2f}%")
+                                            b2.metric("Beta", f"{bench_report['beta']:.2f}")
+                                            b3.metric("Correlation", f"{bench_report['correlation']:.2f}")
+                                            b4, b5, b6 = st.columns(3)
+                                            b4.metric("Tracking Error", f"{bench_report['tracking_error_pct']:.2f}%")
+                                            b5.metric("Information Ratio", f"{bench_report['information_ratio']:.2f}")
+                                            b6.metric("Relative Return", f"{bench_report['relative_return_pct']:+.2f}%")
+                                        except ValueError as e:
+                                            st.info(str(e))
+
+                                # ---- Strategy leaderboard ----
+                                st.markdown("**Strategy leaderboard** (Buy & Hold vs. simple systematic rules, no lookahead bias)")
+                                leaderboard = strat.run_starter_leaderboard(closes_full)
+                                lb_rows = [{
+                                    "Strategy": r.name,
+                                    "Ann. Return %": round(r.annualized_return_pct, 2),
+                                    "Win Rate %": round(r.win_rate_pct, 1),
+                                    "Sharpe": round(r.sharpe_ratio, 2),
+                                    "Sortino": round(r.sortino_ratio, 2),
+                                    "Profit Factor": (round(r.profit_factor, 2) if r.profit_factor != float("inf") else "∞"),
+                                    "Max Drawdown %": round(r.max_drawdown_pct, 2),
+                                    "Trades": r.trade_count,
+                                } for r in leaderboard]
+                                st.dataframe(pd.DataFrame(lb_rows), use_container_width=True, hide_index=True)
+
+                                buy_hold = next((r for r in leaderboard if r.name == "Buy & Hold"), None)
+                                best = leaderboard[0]
+                                if buy_hold and best.name != "Buy & Hold" and best.sharpe_ratio > buy_hold.sharpe_ratio:
+                                    st.success(
+                                        f"📌 Historically, **{best.name}** had a better risk-adjusted return "
+                                        f"(Sharpe {best.sharpe_ratio:.2f}) than simple Buy & Hold "
+                                        f"(Sharpe {buy_hold.sharpe_ratio:.2f}) for this asset."
+                                    )
+                                else:
+                                    st.info("📌 Historically, simple Buy & Hold performed as well as or better than the other rules tested here.")
+
+                                fig_eq = go.Figure()
+                                for r in leaderboard:
+                                    fig_eq.add_trace(go.Scatter(x=r.equity_curve.index, y=r.equity_curve, name=r.name))
+                                fig_eq.update_layout(
+                                    height=300, title="Strategy equity curves (start = 100)",
+                                    margin=dict(t=30, b=10, l=10, r=10),
+                                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                                )
+                                st.plotly_chart(fig_eq, use_container_width=True, key=f"eq_{stats.asset}")
+
+                                st.caption(
+                                    "Strategy backtests use next-day execution (today's signal, tomorrow's return) "
+                                    "to avoid lookahead bias, and do not account for trading fees, slippage, taxes, "
+                                    "or bid/ask spreads. Past strategy performance does not guarantee future results."
+                                )
 
 st.divider()
 st.caption(
