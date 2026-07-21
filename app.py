@@ -439,6 +439,40 @@ TOP5_CRYPTO = "BTC-USD, ETH-USD, BNB-USD, SOL-USD, XRP-USD"
 TOP5_INDIA = "RELIANCE.NS, TCS.NS, HDFCBANK.NS, ICICIBANK.NS, INFY.NS"
 
 
+TICKER_TO_NAME = {
+    "AAPL": "Apple Inc.", "MSFT": "Microsoft Corporation", "GOOGL": "Alphabet Inc. (Google)",
+    "AMZN": "Amazon.com Inc.", "NVDA": "NVIDIA Corporation",
+    "BTC-USD": "Bitcoin", "ETH-USD": "Ethereum", "BNB-USD": "BNB",
+    "SOL-USD": "Solana", "XRP-USD": "XRP",
+    "RELIANCE.NS": "Reliance Industries Ltd", "TCS.NS": "Tata Consultancy Services",
+    "HDFCBANK.NS": "HDFC Bank Ltd", "ICICIBANK.NS": "ICICI Bank Ltd", "INFY.NS": "Infosys Ltd",
+}
+
+# Stocks: domain used with Clearbit's free logo API (no key required).
+TICKER_TO_DOMAIN = {
+    "AAPL": "apple.com", "MSFT": "microsoft.com", "GOOGL": "google.com",
+    "AMZN": "amazon.com", "NVDA": "nvidia.com",
+    "RELIANCE.NS": "ril.com", "TCS.NS": "tcs.com", "HDFCBANK.NS": "hdfcbank.com",
+    "ICICIBANK.NS": "icicibank.com", "INFY.NS": "infosys.com",
+}
+
+# Crypto: CoinCap's free public icon CDN, keyed by lowercase symbol.
+CRYPTO_TO_SYMBOL = {"BTC-USD": "btc", "ETH-USD": "eth", "BNB-USD": "bnb", "SOL-USD": "sol", "XRP-USD": "xrp"}
+
+
+def get_display_name(ticker: str) -> str:
+    return TICKER_TO_NAME.get(ticker, ticker)
+
+
+def get_logo_url(ticker: str):
+    """Returns a logo image URL, or None if we don't have a mapping for this ticker."""
+    if ticker in CRYPTO_TO_SYMBOL:
+        return f"https://assets.coincap.io/assets/icons/{CRYPTO_TO_SYMBOL[ticker]}@2x.png"
+    if ticker in TICKER_TO_DOMAIN:
+        return f"https://logo.clearbit.com/{TICKER_TO_DOMAIN[ticker]}"
+    return None
+
+
 def get_market_status(ticker: str) -> str:
     """
     Best-effort market open/closed check using exchange trading hours in the
@@ -519,7 +553,7 @@ def build_top5_rate_table(tickers_csv: str) -> list:
 
 
 def render_top5_table(rows: list):
-    """Renders the Top-5 table as HTML with color-coded live rate and a market-status badge."""
+    """Renders the Top-5 table as HTML with logo, full name, color-coded live rate, and market-status badge."""
     html = (
         "<table style='width:100%;border-collapse:collapse;font-size:13px;'>"
         "<tr style='border-bottom:1px solid rgba(128,128,128,0.4);'>"
@@ -532,10 +566,27 @@ def render_top5_table(rows: list):
         "</tr>"
     )
     for r in rows:
+        ticker = r["ticker"]
+        name = get_display_name(ticker)
+        logo_url = get_logo_url(ticker)
+        logo_html = (
+            f"<img src='{logo_url}' style='width:24px;height:24px;border-radius:50%;"
+            f"object-fit:contain;vertical-align:middle;margin-right:8px;' "
+            f"onerror=\"this.style.display='none'\" />"
+            if logo_url else
+            "<span style='display:inline-block;width:24px;height:24px;border-radius:50%;"
+            "background:rgba(128,128,128,0.25);vertical-align:middle;margin-right:8px;'></span>"
+        )
+        name_block = (
+            f"<div style='display:flex;align-items:center;'>{logo_html}"
+            f"<div><div style='font-weight:600;'>{name}</div>"
+            f"<div style='font-size:11px;color:gray;'>{ticker}</div></div></div>"
+        )
+
         if not r.get("ok"):
             html += (
                 f"<tr style='border-bottom:1px solid rgba(128,128,128,0.2);'>"
-                f"<td style='padding:8px 4px;font-weight:600;'>{r['ticker']}</td>"
+                f"<td style='padding:8px 4px;'>{name_block}</td>"
                 f"<td colspan='5' style='padding:8px 4px;color:gray;'>Unavailable: {r.get('error','')}</td>"
                 f"</tr>"
             )
@@ -547,7 +598,7 @@ def render_top5_table(rows: list):
         status_color = "#2ecc71" if "Open" in r["market_status"] else "#888"
         html += (
             f"<tr style='border-bottom:1px solid rgba(128,128,128,0.2);'>"
-            f"<td style='padding:10px 4px;font-weight:600;'>{r['ticker']}</td>"
+            f"<td style='padding:10px 4px;'>{name_block}</td>"
             f"<td style='padding:10px 4px;text-align:right;color:{rate_color};font-weight:600;'>"
             f"{r['currency']}{r['live_price']:,.2f}{chg_txt}</td>"
             f"<td style='padding:10px 4px;text-align:center;'>"
