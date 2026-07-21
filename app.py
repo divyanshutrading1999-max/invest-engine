@@ -236,7 +236,7 @@ def fetch_price_history(ticker: str, timeout_sec: int = 20, retries: int = 4):
     return closes, None
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def fetch_live_quote(ticker: str):
     """
     Returns a dict with the latest available quote, or None if unavailable.
@@ -448,29 +448,30 @@ TICKER_TO_NAME = {
     "HDFCBANK.NS": "HDFC Bank Ltd", "ICICIBANK.NS": "ICICI Bank Ltd", "INFY.NS": "Infosys Ltd",
 }
 
-# Stocks: domain used with Clearbit's free logo API (no key required).
-TICKER_TO_DOMAIN = {
-    "AAPL": "apple.com", "MSFT": "microsoft.com", "GOOGL": "google.com",
-    "AMZN": "amazon.com", "NVDA": "nvidia.com",
-    "RELIANCE.NS": "ril.com", "TCS.NS": "tcs.com", "HDFCBANK.NS": "hdfcbank.com",
-    "ICICIBANK.NS": "icicibank.com", "INFY.NS": "infosys.com",
-}
-
-# Crypto: CoinCap's free public icon CDN, keyed by lowercase symbol.
-CRYPTO_TO_SYMBOL = {"BTC-USD": "btc", "ETH-USD": "eth", "BNB-USD": "bnb", "SOL-USD": "sol", "XRP-USD": "xrp"}
+# Deterministic avatar colors -- avoids depending on external logo CDNs (Clearbit/CoinCap),
+# which are unreliable to hotlink from arbitrary deployed apps and were failing to load.
+AVATAR_PALETTE = ["#4A90D9", "#50B87C", "#D9784A", "#B05FC7", "#D94A7A", "#4AAFD9", "#8FB84A"]
 
 
 def get_display_name(ticker: str) -> str:
     return TICKER_TO_NAME.get(ticker, ticker)
 
 
-def get_logo_url(ticker: str):
-    """Returns a logo image URL, or None if we don't have a mapping for this ticker."""
-    if ticker in CRYPTO_TO_SYMBOL:
-        return f"https://assets.coincap.io/assets/icons/{CRYPTO_TO_SYMBOL[ticker]}@2x.png"
-    if ticker in TICKER_TO_DOMAIN:
-        return f"https://logo.clearbit.com/{TICKER_TO_DOMAIN[ticker]}"
-    return None
+def get_avatar(ticker: str):
+    """
+    Returns (initials, hex_color) for a deterministic, locally-rendered avatar
+    circle -- no external network request, so it always renders reliably.
+    """
+    name = get_display_name(ticker)
+    words = [w for w in name.replace(".", " ").split() if w]
+    if len(words) >= 2:
+        letters = (words[0][0] + words[1][0]).upper()
+    elif len(words) == 1:
+        letters = words[0][:2].upper()
+    else:
+        letters = ticker[:2].upper()
+    color = AVATAR_PALETTE[hash(ticker) % len(AVATAR_PALETTE)]
+    return letters, color
 
 
 def get_market_status(ticker: str) -> str:
@@ -568,14 +569,12 @@ def render_top5_table(rows: list):
     for r in rows:
         ticker = r["ticker"]
         name = get_display_name(ticker)
-        logo_url = get_logo_url(ticker)
+        initials, avatar_color = get_avatar(ticker)
         logo_html = (
-            f"<img src='{logo_url}' style='width:24px;height:24px;border-radius:50%;"
-            f"object-fit:contain;vertical-align:middle;margin-right:8px;' "
-            f"onerror=\"this.style.display='none'\" />"
-            if logo_url else
-            "<span style='display:inline-block;width:24px;height:24px;border-radius:50%;"
-            "background:rgba(128,128,128,0.25);vertical-align:middle;margin-right:8px;'></span>"
+            f"<span style='display:inline-flex;align-items:center;justify-content:center;"
+            f"width:26px;height:26px;border-radius:50%;background:{avatar_color};"
+            f"color:white;font-size:11px;font-weight:600;vertical-align:middle;"
+            f"margin-right:8px;flex-shrink:0;'>{initials}</span>"
         )
         name_block = (
             f"<div style='display:flex;align-items:center;'>{logo_html}"
@@ -637,16 +636,21 @@ with q3:
         st.session_state["expand_manual"] = True
         st.session_state["top5_table_group"] = TOP5_INDIA
 
-if st.session_state["top5_table_group"]:
-    with st.spinner("Pulling live rates and 30-day historical ranges..."):
+@st.fragment(run_every=30)
+def _render_top5_fragment():
+    if st.session_state["top5_table_group"]:
         top5_rows = build_top5_rate_table(st.session_state["top5_table_group"])
-    render_top5_table(top5_rows)
-    st.caption(
-        "Lowest/Highest expected = the 5th/95th percentile of historical 30-day returns applied to "
-        "today's price — not a guarantee, and not the absolute best or worst that could happen. "
-        "Rates shown in each stock's own listing currency. Market status doesn't account for public "
-        "holidays."
-    )
+        render_top5_table(top5_rows)
+        st.caption(
+            f"Auto-refreshes every 30s (last pulled {pd.Timestamp.now().strftime('%H:%M:%S')}) · "
+            "Lowest/Highest expected = the 5th/95th percentile of historical 30-day returns applied "
+            "to today's price — not a guarantee. Rates shown in each stock's own listing currency. "
+            "Market status doesn't account for public holidays."
+        )
+
+
+if st.session_state["top5_table_group"]:
+    _render_top5_fragment()
 
 st.subheader("Ask in plain English")
 prompt_text = st.text_input(
