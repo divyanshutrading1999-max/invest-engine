@@ -160,6 +160,22 @@ def is_crypto_ticker(ticker: str) -> bool:
     return "-" in t and t.endswith(("USD", "USDT"))
 
 
+def is_indian_ticker(ticker: str) -> bool:
+    t = ticker.upper()
+    return t.endswith((".NS", ".BO")) or t in ("^NSEI", "^BSESN")
+
+
+def currency_symbol(ticker: str) -> str:
+    """
+    Yahoo Finance returns prices in the listing exchange's native currency --
+    NSE/BSE-listed stocks are priced in INR, not USD. Dollar-sign labels on
+    Indian tickers would be actively misleading, so this picks the right symbol.
+    Does not perform currency conversion -- the amount you enter is treated as
+    being in the displayed asset's own currency.
+    """
+    return "₹" if is_indian_ticker(ticker) else "$"
+
+
 def _get_browser_session():
     """
     Yahoo Finance increasingly blocks requests that look bot-like (default
@@ -247,7 +263,9 @@ def fetch_and_analyze(ticker: str, amount: float, calendar_days: int, timeout_se
     except Exception as e:
         return None, f"Unexpected error analyzing '{ticker}': {e}"
 
-    note = "crypto (7-day weeks)" if crypto else "stock/ETF (trading-day weeks)"
+    note = "crypto (7-day weeks)" if crypto else (
+        "Indian stock/ETF, NSE/BSE (trading-day weeks)" if is_indian_ticker(ticker) else "stock/ETF (trading-day weeks)"
+    )
     return stats, note
 
 
@@ -264,6 +282,19 @@ NAME_TO_TICKER = {
     "bitcoin": "BTC-USD", "btc": "BTC-USD", "ethereum": "ETH-USD", "eth": "ETH-USD",
     "solana": "SOL-USD", "sol": "SOL-USD", "binance coin": "BNB-USD", "bnb": "BNB-USD",
     "dogecoin": "DOGE-USD", "doge": "DOGE-USD", "ripple": "XRP-USD", "xrp": "XRP-USD",
+    # Indian stocks (NSE tickers, .NS suffix)
+    "reliance": "RELIANCE.NS", "tcs": "TCS.NS", "infosys": "INFY.NS", "infy": "INFY.NS",
+    "hdfc bank": "HDFCBANK.NS", "hdfc": "HDFCBANK.NS", "icici bank": "ICICIBANK.NS",
+    "icici": "ICICIBANK.NS", "sbi": "SBIN.NS", "state bank of india": "SBIN.NS",
+    "itc": "ITC.NS", "bharti airtel": "BHARTIARTL.NS", "airtel": "BHARTIARTL.NS",
+    "wipro": "WIPRO.NS", "hcl tech": "HCLTECH.NS", "hcltech": "HCLTECH.NS",
+    "maruti": "MARUTI.NS", "maruti suzuki": "MARUTI.NS", "tata motors": "TATAMOTORS.NS",
+    "tata steel": "TATASTEEL.NS", "adani enterprises": "ADANIENT.NS", "adani": "ADANIENT.NS",
+    "asian paints": "ASIANPAINT.NS", "bajaj finance": "BAJFINANCE.NS",
+    "kotak bank": "KOTAKBANK.NS", "kotak mahindra bank": "KOTAKBANK.NS",
+    "larsen": "LT.NS", "larsen and toubro": "LT.NS", "l&t": "LT.NS",
+    "sun pharma": "SUNPHARMA.NS", "nifty": "^NSEI", "nifty 50": "^NSEI",
+    "sensex": "^BSESN", "bse sensex": "^BSESN",
 }
 
 
@@ -386,7 +417,8 @@ with st.expander("Or fill in the fields manually"):
         m_tickers_raw = st.text_input(
             "Assets (comma-separated)",
             value="AAPL, MSFT, BTC-USD",
-            help="Stock tickers (AAPL, RELIANCE.NS, TCS.BO) and/or crypto (BTC-USD, ETH-USD, SOL-USD)",
+            help="Stock tickers (AAPL, RELIANCE.NS, TCS.BO) and/or crypto (BTC-USD, ETH-USD, SOL-USD). "
+                 "For Indian stocks use the NSE (.NS) or BSE (.BO) suffix.",
         )
         manual_submitted = st.form_submit_button("Run Analysis (manual)")
 
@@ -394,16 +426,53 @@ adv_col1, adv_col2 = st.columns([2, 1])
 with adv_col1:
     benchmark_choice = st.selectbox(
         "Compare against benchmark",
-        ["SPY (S&P 500)", "QQQ (Nasdaq 100)", "GLD (Gold)", "BTC-USD", "None"],
+        ["SPY (S&P 500)", "QQQ (Nasdaq 100)", "GLD (Gold)", "BTC-USD",
+         "NIFTY 50 (India)", "SENSEX (India)", "None"],
         index=0,
+        help="Note: comparing a USD-priced asset against an INR-priced benchmark (or vice versa) "
+             "mixes currencies — the % and ratio metrics (beta, correlation) are still valid since "
+             "they're computed on returns, not absolute price levels, but keep the currency mismatch in mind.",
     )
 with adv_col2:
     run_advanced = st.checkbox("Include risk/strategy analysis", value=True,
                                 help="Adds risk metrics, benchmark comparison, and a strategy backtest leaderboard for each asset — takes a bit longer.")
 
+cur_col1, cur_col2 = st.columns([2, 1])
+with cur_col1:
+    currency_choice = st.selectbox(
+        "Display currency for the amount you enter",
+        ["Auto (₹ for Indian stocks, $ for everything else)", "USD ($)", "AED (د.إ)", "INR (₹)",
+         "EUR (€)", "GBP (£)", "SAR (﷼)", "JPY (¥)", "SGD (S$)", "Custom"],
+        index=0,
+        help="This does NOT convert currencies — it just labels your amount and the projected "
+             "results in the currency you pick, and applies the historical % return directly to "
+             "that number. It does not account for exchange-rate movements.",
+    )
+with cur_col2:
+    custom_currency_symbol = None
+    if currency_choice == "Custom":
+        custom_currency_symbol = st.text_input("Symbol/code", value="CHF", max_chars=6)
+
+CURRENCY_SYMBOL_MAP = {
+    "USD ($)": "$", "AED (د.إ)": "د.إ", "INR (₹)": "₹", "EUR (€)": "€",
+    "GBP (£)": "£", "SAR (﷼)": "﷼", "JPY (¥)": "¥", "SGD (S$)": "S$",
+}
+if currency_choice.startswith("Auto"):
+    forced_currency_symbol = None  # fall back to per-asset auto-detection ($/₹)
+elif currency_choice == "Custom":
+    forced_currency_symbol = (custom_currency_symbol or "").strip() or "$"
+else:
+    forced_currency_symbol = CURRENCY_SYMBOL_MAP[currency_choice]
+
+
+def display_currency(ticker: str) -> str:
+    """Uses the user's chosen display currency if set, otherwise auto-detects per asset."""
+    return forced_currency_symbol if forced_currency_symbol else currency_symbol(ticker)
+
+
 BENCHMARK_MAP = {
     "SPY (S&P 500)": "SPY", "QQQ (Nasdaq 100)": "QQQ", "GLD (Gold)": "GLD",
-    "BTC-USD": "BTC-USD", "None": None,
+    "BTC-USD": "BTC-USD", "NIFTY 50 (India)": "^NSEI", "SENSEX (India)": "^BSESN", "None": None,
 }
 benchmark_ticker = BENCHMARK_MAP[benchmark_choice]
 
@@ -418,7 +487,7 @@ if prompt_submitted:
             for w in p_warnings:
                 st.warning(w)
         st.info(
-            f"**Understood:** Amount = {f'${p_amount:,.0f}' if p_amount else '—'} | "
+            f"**Understood:** Amount = {f'{p_amount:,.0f}' if p_amount else '—'} | "
             f"Holding period = {f'{p_days} days' if p_days else '—'} | "
             f"Assets = {', '.join(p_tickers) if p_tickers else '—'}\n\n"
             "If that's wrong, use the manual fields below instead."
@@ -479,7 +548,19 @@ if submitted:
             st.error("No assets could be analyzed. Check your tickers and try again.")
         else:
             ranked = sorted(results, key=lambda r: r[0].risk_adjusted, reverse=True)
-            st.success(f"✅ Analysis complete for {len(results)} of {len(tickers)} asset(s), on ${amount:,.0f} over {days} days.")
+            summary_cur = forced_currency_symbol if forced_currency_symbol else ""
+            st.success(f"✅ Analysis complete for {len(results)} of {len(tickers)} asset(s), on {summary_cur}{amount:,.0f} over {days} days.")
+            if forced_currency_symbol:
+                st.caption(
+                    f"ℹ️ All amounts shown in {forced_currency_symbol} as selected — this tool doesn't convert "
+                    "currencies, it applies the historical % return directly to your entered amount and "
+                    "labels the result in your chosen currency. Exchange-rate movements aren't modeled."
+                )
+            elif any(is_indian_ticker(s.asset) for s, _ in results):
+                st.caption(
+                    "ℹ️ Indian stocks (NSE/BSE) are shown in ₹ — this tool does not convert currencies, "
+                    "the amount you entered is applied as-is per asset in that asset's own currency."
+                )
 
             # ---- Comparison chart across assets (if more than one) ----
             if len(ranked) > 1:
@@ -573,9 +654,10 @@ if submitted:
 
                     # ---- Dollar projection ----
                     d1, d2, d3 = st.columns(3)
-                    d1.metric("If worst case", f"${stats.worst_value:,.0f}", f"{stats.worst_case_pct:+.1f}%")
-                    d2.metric("If median case", f"${stats.median_value:,.0f}", f"{stats.median_return_pct:+.1f}%")
-                    d3.metric("If best case", f"${stats.best_value:,.0f}", f"{stats.best_case_pct:+.1f}%")
+                    cur = display_currency(stats.asset)
+                    d1.metric("If worst case", f"{cur}{stats.worst_value:,.0f}", f"{stats.worst_case_pct:+.1f}%")
+                    d2.metric("If median case", f"{cur}{stats.median_value:,.0f}", f"{stats.median_return_pct:+.1f}%")
+                    d3.metric("If best case", f"{cur}{stats.best_value:,.0f}", f"{stats.best_case_pct:+.1f}%")
 
                     # ---- Full distribution (optional deep-dive) ----
                     with st.expander("See full historical distribution"):
