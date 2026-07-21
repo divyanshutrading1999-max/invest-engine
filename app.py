@@ -160,8 +160,24 @@ def is_crypto_ticker(ticker: str) -> bool:
     return "-" in t and t.endswith(("USD", "USDT"))
 
 
+def _get_browser_session():
+    """
+    Yahoo Finance increasingly blocks requests that look bot-like (default
+    Python requests library TLS/user-agent fingerprint), especially from
+    shared cloud IPs like Streamlit Cloud's. curl_cffi impersonates a real
+    Chrome browser's network fingerprint, which reliably avoids this.
+    Falls back to None (plain yfinance session) if curl_cffi isn't available
+    or fails to initialize, so the app never breaks over this.
+    """
+    try:
+        from curl_cffi import requests as cffi_requests
+        return cffi_requests.Session(impersonate="chrome")
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_price_history(ticker: str, timeout_sec: int = 15, retries: int = 3):
+def fetch_price_history(ticker: str, timeout_sec: int = 20, retries: int = 4):
     """
     Returns (closes: pd.Series or None, error_message: str or None).
     Shared by fetch_and_analyze and the advanced-analysis features (risk
@@ -169,23 +185,28 @@ def fetch_price_history(ticker: str, timeout_sec: int = 15, retries: int = 3):
     tested source of price data with the same retry/error handling everywhere.
     """
     import time
+    import random
     import yfinance as yf
 
     ticker = ticker.strip().upper()
     if not ticker:
         return None, "Empty ticker."
 
+    session = _get_browser_session()
+
     hist = None
     had_exception = False
     for attempt in range(retries):
         try:
-            hist = yf.Ticker(ticker).history(period="5y", auto_adjust=True, timeout=timeout_sec)
+            ticker_obj = yf.Ticker(ticker, session=session) if session is not None else yf.Ticker(ticker)
+            hist = ticker_obj.history(period="5y", auto_adjust=True, timeout=timeout_sec)
             had_exception = False
             if hist is not None and not hist.empty:
                 break
         except Exception:
             had_exception = True
-        time.sleep(1.5 * (attempt + 1))
+        # exponential backoff with jitter, so retries don't all collide on the same rate-limit window
+        time.sleep((1.5 * (2 ** attempt)) + random.uniform(0, 1))
 
     if hist is None or hist.empty:
         if had_exception:
@@ -199,7 +220,7 @@ def fetch_price_history(ticker: str, timeout_sec: int = 15, retries: int = 3):
     return closes, None
 
 
-def fetch_and_analyze(ticker: str, amount: float, calendar_days: int, timeout_sec: int = 15, retries: int = 3):
+def fetch_and_analyze(ticker: str, amount: float, calendar_days: int, timeout_sec: int = 20, retries: int = 4):
     """
     Returns (ReturnStats, note) on success, or (None, error_message) on failure.
     Every failure mode is caught and turned into a plain-English message —
