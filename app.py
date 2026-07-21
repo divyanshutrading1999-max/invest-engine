@@ -236,6 +236,42 @@ def fetch_price_history(ticker: str, timeout_sec: int = 20, retries: int = 4):
     return closes, None
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_live_quote(ticker: str):
+    """
+    Returns a dict with the latest available quote, or None if unavailable.
+    Uses yfinance's fast_info (lighter weight than the full .info scrape).
+    Note: Yahoo Finance's free tier is typically delayed 15-20 minutes for
+    stocks during market hours (crypto is closer to real-time) — this is NOT
+    a live tick-by-tick feed, and the UI must label it accurately.
+    Falls back to None on any failure so the caller can fall back further
+    (e.g. to the last close from the 5-year history) rather than break.
+    """
+    import yfinance as yf
+
+    ticker = ticker.strip().upper()
+    if not ticker:
+        return None
+
+    try:
+        session = _get_browser_session()
+        t = yf.Ticker(ticker, session=session) if session is not None else yf.Ticker(ticker)
+        fi = t.fast_info
+        last_price = fi.get("last_price") if hasattr(fi, "get") else fi.last_price
+        prev_close = fi.get("previous_close") if hasattr(fi, "get") else fi.previous_close
+        if last_price is None or prev_close is None or prev_close == 0:
+            return None
+        change_pct = (last_price - prev_close) / prev_close * 100
+        return {
+            "last_price": float(last_price),
+            "previous_close": float(prev_close),
+            "change_pct": float(change_pct),
+            "fetched_at": pd.Timestamp.now(),
+        }
+    except Exception:
+        return None
+
+
 def fetch_and_analyze(ticker: str, amount: float, calendar_days: int, timeout_sec: int = 20, retries: int = 4):
     """
     Returns (ReturnStats, note) on success, or (None, error_message) on failure.
@@ -402,10 +438,135 @@ TOP5_US = "AAPL, MSFT, GOOGL, AMZN, NVDA"
 TOP5_CRYPTO = "BTC-USD, ETH-USD, BNB-USD, SOL-USD, XRP-USD"
 TOP5_INDIA = "RELIANCE.NS, TCS.NS, HDFCBANK.NS, ICICIBANK.NS, INFY.NS"
 
+
+def get_market_status(ticker: str) -> str:
+    """
+    Best-effort market open/closed check using exchange trading hours in the
+    exchange's local timezone. Does NOT account for public holidays (that
+    would need a market-calendar data source this tool doesn't have) — the
+    UI notes that limitation. Crypto trades 24/7 so it's always "Open".
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    if is_crypto_ticker(ticker):
+        return "Open (24/7)"
+
+    if is_indian_ticker(ticker):
+        tz, open_hm, close_hm = ZoneInfo("Asia/Kolkata"), (9, 15), (15, 30)
+    else:
+        tz, open_hm, close_hm = ZoneInfo("America/New_York"), (9, 30), (16, 0)
+
+    now = datetime.now(tz)
+    if now.weekday() >= 5:  # Saturday/Sunday
+        return "Closed"
+    now_min = now.hour * 60 + now.minute
+    open_min = open_hm[0] * 60 + open_hm[1]
+    close_min = close_hm[0] * 60 + close_hm[1]
+    return "Open" if open_min <= now_min <= close_min else "Closed"
+
+
+def build_top5_rate_table(tickers_csv: str) -> list:
+    """
+    Builds quick-glance data per asset: live rate, today's change (for color
+    coding), market open/closed status, last close, and the expected 30-day
+    low/high range based on historical 5th/95th percentile returns applied
+    to the current price. Returns a list of dicts (not a plain DataFrame) so
+    the caller can render it with custom per-cell coloring.
+    """
+    rows = []
+    for ticker in [t.strip().upper() for t in tickers_csv.split(",") if t.strip()]:
+        cur = currency_symbol(ticker)
+        market_status = get_market_status(ticker)
+        stats, err = fetch_and_analyze(ticker, amount=1, calendar_days=30)
+        if stats is None:
+            rows.append({
+                "ticker": ticker, "ok": False, "error": err, "market_status": market_status,
+            })
+            continue
+
+        quote = fetch_live_quote(ticker)
+        if quote:
+            live_price = quote["last_price"]
+            change_pct = quote["change_pct"]
+            last_close = quote["previous_close"]
+        else:
+            fallback_closes, _ = fetch_price_history(ticker)
+            if fallback_closes is not None and len(fallback_closes) >= 2:
+                live_price = float(fallback_closes.iloc[-1])
+                last_close = float(fallback_closes.iloc[-2])
+                change_pct = (live_price - last_close) / last_close * 100
+            else:
+                live_price = None
+                change_pct = None
+                last_close = None
+
+        if live_price is None:
+            rows.append({
+                "ticker": ticker, "ok": False, "error": "Price unavailable", "market_status": market_status,
+            })
+            continue
+
+        lowest = live_price * (1 + stats.worst_case_pct / 100)
+        highest = live_price * (1 + stats.best_case_pct / 100)
+        rows.append({
+            "ticker": ticker, "ok": True, "currency": cur,
+            "live_price": live_price, "change_pct": change_pct,
+            "last_close": last_close, "market_status": market_status,
+            "lowest": lowest, "highest": highest,
+        })
+    return rows
+
+
+def render_top5_table(rows: list):
+    """Renders the Top-5 table as HTML with color-coded live rate and a market-status badge."""
+    html = (
+        "<table style='width:100%;border-collapse:collapse;font-size:13px;'>"
+        "<tr style='border-bottom:1px solid rgba(128,128,128,0.4);'>"
+        "<td style='padding:8px 4px;color:gray;'>Stock</td>"
+        "<td style='padding:8px 4px;color:gray;text-align:right;'>Live rate</td>"
+        "<td style='padding:8px 4px;color:gray;text-align:center;'>Market</td>"
+        "<td style='padding:8px 4px;color:gray;text-align:right;'>Last close</td>"
+        "<td style='padding:8px 4px;color:gray;text-align:right;'>Lowest expected (30d)</td>"
+        "<td style='padding:8px 4px;color:gray;text-align:right;'>Highest expected (30d)</td>"
+        "</tr>"
+    )
+    for r in rows:
+        if not r.get("ok"):
+            html += (
+                f"<tr style='border-bottom:1px solid rgba(128,128,128,0.2);'>"
+                f"<td style='padding:8px 4px;font-weight:600;'>{r['ticker']}</td>"
+                f"<td colspan='5' style='padding:8px 4px;color:gray;'>Unavailable: {r.get('error','')}</td>"
+                f"</tr>"
+            )
+            continue
+        chg = r["change_pct"]
+        rate_color = "#2ecc71" if chg is not None and chg >= 0 else "#e74c3c"
+        arrow = "▲" if chg is not None and chg >= 0 else "▼"
+        chg_txt = f" {arrow} {chg:+.2f}%" if chg is not None else ""
+        status_color = "#2ecc71" if "Open" in r["market_status"] else "#888"
+        html += (
+            f"<tr style='border-bottom:1px solid rgba(128,128,128,0.2);'>"
+            f"<td style='padding:10px 4px;font-weight:600;'>{r['ticker']}</td>"
+            f"<td style='padding:10px 4px;text-align:right;color:{rate_color};font-weight:600;'>"
+            f"{r['currency']}{r['live_price']:,.2f}{chg_txt}</td>"
+            f"<td style='padding:10px 4px;text-align:center;'>"
+            f"<span style='color:{status_color};font-size:12px;'>● {r['market_status']}</span></td>"
+            f"<td style='padding:10px 4px;text-align:right;'>{r['currency']}{r['last_close']:,.2f}</td>"
+            f"<td style='padding:10px 4px;text-align:right;color:#e74c3c;'>{r['currency']}{r['lowest']:,.2f}</td>"
+            f"<td style='padding:10px 4px;text-align:right;color:#2ecc71;'>{r['currency']}{r['highest']:,.2f}</td>"
+            f"</tr>"
+        )
+    html += "</table>"
+    st.markdown(html, unsafe_allow_html=True)
+
+
 if "manual_tickers_input" not in st.session_state:
     st.session_state["manual_tickers_input"] = "AAPL, MSFT, BTC-USD"
 if "expand_manual" not in st.session_state:
     st.session_state["expand_manual"] = False
+if "top5_table_group" not in st.session_state:
+    st.session_state["top5_table_group"] = None
 
 st.caption("Quick pick a curated list (major companies/coins by market cap — not live-ranked):")
 q1, q2, q3 = st.columns(3)
@@ -413,14 +574,28 @@ with q1:
     if st.button("🇺🇸 Top 5 US Stocks", use_container_width=True):
         st.session_state["manual_tickers_input"] = TOP5_US
         st.session_state["expand_manual"] = True
+        st.session_state["top5_table_group"] = TOP5_US
 with q2:
     if st.button("₿ Top 5 Crypto", use_container_width=True):
         st.session_state["manual_tickers_input"] = TOP5_CRYPTO
         st.session_state["expand_manual"] = True
+        st.session_state["top5_table_group"] = TOP5_CRYPTO
 with q3:
     if st.button("🇮🇳 Top 5 Indian Stocks", use_container_width=True):
         st.session_state["manual_tickers_input"] = TOP5_INDIA
         st.session_state["expand_manual"] = True
+        st.session_state["top5_table_group"] = TOP5_INDIA
+
+if st.session_state["top5_table_group"]:
+    with st.spinner("Pulling live rates and 30-day historical ranges..."):
+        top5_rows = build_top5_rate_table(st.session_state["top5_table_group"])
+    render_top5_table(top5_rows)
+    st.caption(
+        "Lowest/Highest expected = the 5th/95th percentile of historical 30-day returns applied to "
+        "today's price — not a guarantee, and not the absolute best or worst that could happen. "
+        "Rates shown in each stock's own listing currency. Market status doesn't account for public "
+        "holidays."
+    )
 
 st.subheader("Ask in plain English")
 prompt_text = st.text_input(
@@ -646,7 +821,14 @@ if submitted:
                 st.plotly_chart(fig_compare, use_container_width=True)
 
             # ---- Per-asset cards ----
-            st.markdown("### Asset breakdown")
+            hdr_col1, hdr_col2 = st.columns([4, 1])
+            with hdr_col1:
+                st.markdown("### Asset breakdown")
+            with hdr_col2:
+                if st.button("🔄 Refresh prices", use_container_width=True):
+                    fetch_live_quote.clear()
+                    st.rerun()
+
             for stats, note in ranked:
                 is_positive = stats.median_return_pct >= 0
                 emoji = "🟢" if is_positive else "🔴"
@@ -657,6 +839,32 @@ if submitted:
                         st.markdown(f"#### {emoji} {stats.asset}  \n*{note} · {stats.num_windows} historical windows analyzed*")
                     with top_col2:
                         st.metric("Win rate", f"{stats.win_rate_pct:.0f}%")
+
+                    # ---- Current market price (delayed, not live tick-by-tick) ----
+                    cur = display_currency(stats.asset)
+                    quote = fetch_live_quote(stats.asset)
+                    if quote:
+                        chg = quote["change_pct"]
+                        chg_color = "var(--text-success)" if chg >= 0 else "var(--text-danger)"
+                        chg_arrow = "▲" if chg >= 0 else "▼"
+                        st.markdown(
+                            f"**Current price:** {cur}{quote['last_price']:,.2f} "
+                            f"<span style='color:{chg_color}'>{chg_arrow} {chg:+.2f}% today</span>  \n"
+                            f"<span style='font-size:0.8em;color:gray'>Quotes are typically delayed 15-20 min for stocks "
+                            f"(not real-time) · fetched {quote['fetched_at'].strftime('%H:%M:%S')}</span>",
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        fallback_closes, _ = fetch_price_history(stats.asset)
+                        if fallback_closes is not None and len(fallback_closes) > 0:
+                            last_close = fallback_closes.iloc[-1]
+                            last_date = fallback_closes.index[-1]
+                            st.caption(
+                                f"Live quote unavailable right now — showing last available close: "
+                                f"{cur}{last_close:,.2f} (as of {last_date.strftime('%Y-%m-%d')})"
+                            )
+                        else:
+                            st.caption("Live quote unavailable right now.")
 
                     # ---- Verdict badge ----
                     st.markdown(
